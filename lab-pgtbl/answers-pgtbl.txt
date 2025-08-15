@@ -1,0 +1,14 @@
+1. sys_sbrk, can store myproc()->sz in our structure
+2. 
+page table 0x0000000087f6b000
+..0: pte 0x0000000021fd9c01 pa 0x0000000087f67000
+.. ..0: pte 0x0000000021fd9801 pa 0x0000000087f66000
+.. .. ..0: pte 0x0000000021fda01b pa 0x0000000087f68000   V,R,X,U  va 0x0000 -> text
+.. .. ..1: pte 0x0000000021fd9417 pa 0x0000000087f65000   V,R,W,U  va 0x1000 -> GP
+.. .. ..2: pte 0x0000000021fd9007 pa 0x0000000087f64000  V,R,W     va 0x2000 -> process stack
+.. .. ..3: pte 0x0000000021fd8c17 pa 0x0000000087f63000  V,R,W,U
+..255: pte 0x0000000021fda801 pa 0x0000000087f6a000      V
+.. ..511: pte 0x0000000021fda401 pa 0x0000000087f69000   V
+.. .. ..509: pte 0x0000000021fdcc13 pa 0x0000000087f73000 V,R,U
+.. .. ..510: pte 0x0000000021fdd007 pa 0x0000000087f74000 V,R,W    va 0x3fffffe000 -> trapframe
+.. .. ..511: pte 0x0000000020001c0b pa 0x0000000080007000 V,R,X    va 0x3ffffff000 -> trapoline

@@ -1,0 +1,207 @@
+diff --git a/answers-pgtbl.txt b/answers-pgtbl.txt
+new file mode 100644
+index 0000000..24e55e2
+--- /dev/null
++++ b/answers-pgtbl.txt
+@@ -0,0 +1,14 @@
++1. sys_sbrk, can store myproc()->sz in our structure
++2. 
++page table 0x0000000087f6b000
++..0: pte 0x0000000021fd9c01 pa 0x0000000087f67000
++.. ..0: pte 0x0000000021fd9801 pa 0x0000000087f66000
++.. .. ..0: pte 0x0000000021fda01b pa 0x0000000087f68000   V,R,X,U  va 0x0000 -> text
++.. .. ..1: pte 0x0000000021fd9417 pa 0x0000000087f65000   V,R,W,U  va 0x1000 -> GP
++.. .. ..2: pte 0x0000000021fd9007 pa 0x0000000087f64000  V,R,W     va 0x2000 -> process stack
++.. .. ..3: pte 0x0000000021fd8c17 pa 0x0000000087f63000  V,R,W,U
++..255: pte 0x0000000021fda801 pa 0x0000000087f6a000      V
++.. ..511: pte 0x0000000021fda401 pa 0x0000000087f69000   V
++.. .. ..509: pte 0x0000000021fdcc13 pa 0x0000000087f73000 V,R,U
++.. .. ..510: pte 0x0000000021fdd007 pa 0x0000000087f74000 V,R,W    va 0x3fffffe000 -> trapframe
++.. .. ..511: pte 0x0000000020001c0b pa 0x0000000080007000 V,R,X    va 0x3ffffff000 -> trapoline
+\ No newline at end of file
+diff --git a/kernel/defs.h b/kernel/defs.h
+index a3c962b..4e4d238 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -185,5 +185,6 @@ void            virtio_disk_init(void);
+ void            virtio_disk_rw(struct buf *, int);
+ void            virtio_disk_intr(void);
+ 
++void vmprint(pagetable_t);
+ // number of elements in fixed-size array
+ #define NELEM(x) (sizeof(x)/sizeof((x)[0]))
+diff --git a/kernel/exec.c b/kernel/exec.c
+index e18bbb6..4f08da2 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -127,7 +127,7 @@ exec(char *path, char **argv)
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp; // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
+-
++  if(p->pid==1) vmprint(p->pagetable);
+   return argc; // this ends up in a0, the first argument to main(argc, argv)
+ 
+  bad:
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..6a5efa4 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -132,6 +132,13 @@ found:
+     return 0;
+   }
+ 
++  if ((p->usyscall = (struct usyscall *)kalloc()) == 0) {
++    freeproc(p);
++    release(&p->lock);
++    return 0;
++  }
++
++  (p->usyscall)->pid = p->pid;
+   // An empty user page table.
+   p->pagetable = proc_pagetable(p);
+   if(p->pagetable == 0){
+@@ -158,6 +165,11 @@ freeproc(struct proc *p)
+   if(p->trapframe)
+     kfree((void*)p->trapframe);
+   p->trapframe = 0;
++
++  if(p->usyscall)
++    kfree((void*)p->usyscall);
++p->usyscall = 0;
++
+   if(p->pagetable)
+     proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
+@@ -202,6 +214,13 @@ proc_pagetable(struct proc *p)
+     return 0;
+   }
+ 
++  if(mappages(pagetable, USYSCALL, PGSIZE, (uint64) (p->usyscall), PTE_R | PTE_U) < 0){
++    uvmunmap(pagetable, TRAMPOLINE, 1, 0);
++    uvmunmap(pagetable, TRAPFRAME, 1, 0);
++    uvmfree(pagetable, 0);
++    return 0;
++}
++
+   return pagetable;
+ }
+ 
+@@ -212,6 +231,7 @@ proc_freepagetable(pagetable_t pagetable, uint64 sz)
+ {
+   uvmunmap(pagetable, TRAMPOLINE, 1, 0);
+   uvmunmap(pagetable, TRAPFRAME, 1, 0);
++  uvmunmap(pagetable, USYSCALL, 1, 0);
+   uvmfree(pagetable, sz);
+ }
+ 
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..03d1a91 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,5 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++  struct usyscall *usyscall;
+ };
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 20a01db..576db65 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -16,6 +16,7 @@ r_mhartid()
+ #define MSTATUS_MPP_S (1L << 11)
+ #define MSTATUS_MPP_U (0L << 11)
+ #define MSTATUS_MIE (1L << 3)    // machine-mode interrupt enable.
++#define PTE_A (1L << 6)
+ 
+ static inline uint64
+ r_mstatus()
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 88644b2..38d9576 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -74,8 +74,32 @@ sys_sleep(void)
+ int
+ sys_pgaccess(void)
+ {
+-  // lab pgtbl: your code here.
+-  return 0;
++  uint64 va;
++  int n;
++  uint64 abitsaddr;
++  struct proc* p = myproc();
++  uint64 buf = 0;
++
++  argaddr(0, &va);
++  argint(1, &n);
++  argaddr(2, &abitsaddr);
++
++  if( n > 32 || n < 0)
++    return -1;
++    
++  pte_t *pte = 0;
++  for(int i = 0; i < n; i++){
++    pte = walk(p->pagetable, va + i * PGSIZE, 0);
++    if(PTE_FLAGS(*pte) & PTE_A)
++      buf = buf | (1L << i);
++    *pte = (*pte) & ~PTE_A;
++    }
++
++    if(copyout(p->pagetable, abitsaddr, (char*)&buf, sizeof(buf)) < 0){
++        panic("error");
++    }
++
++    return 0;
+ }
+ #endif
+ 
+@@ -99,4 +123,4 @@ sys_uptime(void)
+   xticks = ticks;
+   release(&tickslock);
+   return xticks;
+-}
++}
+\ No newline at end of file
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 5c31e87..6e58718 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -449,3 +449,28 @@ copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max)
+     return -1;
+   }
+ }
++
++void vmprintwrapper(pagetable_t pagetable, int level);
++
++void vmprint(pagetable_t pagetable)
++{
++  vmprintwrapper(pagetable, 0);
++}
++
++void vmprintwrapper(pagetable_t pagetable, int level)
++{
++  if (level == 0) printf("page table %p\n", pagetable);
++  if (level >= 3) return;
++
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = pagetable[i];
++    if (!(pte & PTE_V)) continue;
++    for (int j = 0; j < level; j++)
++      printf(".. ");
++    uint64 pa = PTE2PA(pte);
++    printf("..%d: pte %p pa %p\n", i, pte, pa);
++
++    if ((pte & (PTE_W|PTE_R|PTE_X)) == 0)
++      vmprintwrapper((pagetable_t) pa, level + 1);
++  }
++}
+\ No newline at end of file
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..e440e5c
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++3
+\ No newline at end of file
