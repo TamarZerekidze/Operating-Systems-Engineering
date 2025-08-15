@@ -1,0 +1,155 @@
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..ed45706 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -38,13 +38,21 @@ sys_wait(void)
+ uint64
+ sys_sbrk(void)
+ {
+-  uint64 addr;
++int addr;
+   int n;
+ 
+   argint(0, &n);
+-  addr = myproc()->sz;
+-  if(growproc(n) < 0)
++
++  struct proc *p = myproc();
++  addr = p->sz;
++
++  if (addr + n < p->trapframe->sp)
+     return -1;
++
++  if (n < 0)
++    uvmdealloc(p->pagetable, p->sz, p->sz + n);
++
++  p->sz += n;
+   return addr;
+ }
+ 
+diff --git a/kernel/trap.c b/kernel/trap.c
+index 512c850..9053bb1 100644
+--- a/kernel/trap.c
++++ b/kernel/trap.c
+@@ -67,6 +67,18 @@ usertrap(void)
+     syscall();
+   } else if((which_dev = devintr()) != 0){
+     // ok
++  } else if(r_scause() == 13 || r_scause() == 15 ){
++    uint64 va = r_stval();
++    char *pa;     
++    if(va > (PGROUNDUP(p->trapframe->sp) - 1)  && va < p->sz && (pa = kalloc()) != 0) {
++      memset(pa, 0, PGSIZE);
++      if (mappages(p->pagetable, PGROUNDDOWN(va), PGSIZE, (uint64)pa, PTE_R | PTE_W | PTE_X | PTE_U) != 0) {
++        kfree(pa);
++        p->killed = 1;
++      }
++    } else {
++      p->killed = 1;
++    }
+   } else {
+     printf("usertrap(): unexpected scause %p pid=%d\n", r_scause(), p->pid);
+     printf("            sepc=%p stval=%p\n", r_sepc(), r_stval());
+diff --git a/kernel/vm.c b/kernel/vm.c
+index 5c31e87..72d9521 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,6 +5,8 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
++#include "spinlock.h"
++#include "proc.h"
+ 
+ /*
+  * the kernel's page table.
+@@ -185,9 +187,9 @@ uvmunmap(pagetable_t pagetable, uint64 va, uint64 npages, int do_free)
+ 
+   for(a = va; a < va + npages*PGSIZE; a += PGSIZE){
+     if((pte = walk(pagetable, a, 0)) == 0)
+-      panic("uvmunmap: walk");
++      continue;
+     if((*pte & PTE_V) == 0)
+-      panic("uvmunmap: not mapped");
++      continue;
+     if(PTE_FLAGS(*pte) == PTE_V)
+       panic("uvmunmap: not a leaf");
+     if(do_free){
+@@ -319,9 +321,9 @@ uvmcopy(pagetable_t old, pagetable_t new, uint64 sz)
+ 
+   for(i = 0; i < sz; i += PGSIZE){
+     if((pte = walk(old, i, 0)) == 0)
+-      panic("uvmcopy: pte should exist");
++      continue;
+     if((*pte & PTE_V) == 0)
+-      panic("uvmcopy: page not present");
++      continue;
+     pa = PTE2PA(*pte);
+     flags = PTE_FLAGS(*pte);
+     if((mem = kalloc()) == 0)
+@@ -366,8 +368,22 @@ copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len)
+     if(va0 >= MAXVA)
+       return -1;
+     pte = walk(pagetable, va0, 0);
+-    if(pte == 0 || (*pte & PTE_V) == 0 || (*pte & PTE_U) == 0 ||
+-       (*pte & PTE_W) == 0)
++    if(pte == 0)
++      return -1;
++    if((*pte & PTE_V) == 0){
++      if (va0 >= myproc()->sz || va0 < myproc()->trapframe->sp)
++        return -1;
++      if ((pa0 = (uint64)kalloc()) == 0)
++        return -1;
++      memset((void*)pa0, 0, PGSIZE);
++      if(mappages (myproc()->pagetable, PGROUNDDOWN(va0), PGSIZE, pa0, PTE_W|PTE_R|PTE_U) != 0){
++        kfree((void*)pa0);
++        return -1;
++      }
++    }
++    if((*pte & PTE_U) == 0)
++      return -1;
++    if((*pte & PTE_W) == 0)
+       return -1;
+     pa0 = PTE2PA(*pte);
+     n = PGSIZE - (dstva - va0);
+@@ -389,12 +405,29 @@ int
+ copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len)
+ {
+   uint64 n, va0, pa0;
+-
++  pte_t *pte;
+   while(len > 0){
+     va0 = PGROUNDDOWN(srcva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if(pa0 == 0)
++    if(va0 >= MAXVA)
++      return -1;
++    pte = walk(pagetable, va0, 0);
++    if(pte == 0)
++      return -1;
++    if((*pte & PTE_V) == 0){
++      if (va0 >= myproc()->sz || va0 < myproc()->trapframe->sp)
++        return -1;
++      if ((pa0 = (uint64)kalloc()) == 0)
++        return -1;
++      memset((void*)pa0, 0, PGSIZE);
++      if(mappages (myproc()->pagetable, PGROUNDDOWN(va0), PGSIZE, pa0, PTE_W|PTE_R|PTE_U) != 0){
++        kfree((void*)pa0);
++        return -1;
++      }
++    }
++    if((*pte & PTE_U) == 0)
+       return -1;
++    pa0 = PTE2PA(*pte);
++
+     n = PGSIZE - (srcva - va0);
+     if(n > len)
+       n = len;
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..62f9457
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++6
+\ No newline at end of file
