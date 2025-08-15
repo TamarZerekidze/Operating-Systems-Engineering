@@ -1,0 +1,5 @@
+
+two threads are trying to add new key to the same bucket.
+table[i] might fail to point at the first entry
+Sequence in insert leading to key being missing is shown below:
+ in insert, e->key = key; part
