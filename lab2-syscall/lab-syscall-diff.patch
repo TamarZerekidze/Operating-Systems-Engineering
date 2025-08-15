@@ -1,0 +1,289 @@
+diff --git a/Makefile b/Makefile
+index 212a89d..68e1ac3 100644
+--- a/Makefile
++++ b/Makefile
+@@ -188,6 +188,8 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
++	$U/_trace\
++	$U/_sysinfotest\
+ 
+ 
+ 
+diff --git a/answers-syscall.txt b/answers-syscall.txt
+new file mode 100644
+index 0000000..2969cc2
+--- /dev/null
++++ b/answers-syscall.txt
+@@ -0,0 +1,6 @@
++trap
++7
++usermode
++lw	s2,0(zero) # 0 <_entry-0x80000000>
++address 0 is not mapped in the kernel address space, it is load page fault
++initcode with process id 1
+\ No newline at end of file
+diff --git a/kernel/kalloc.c b/kernel/kalloc.c
+index 0699e7e..e05af7e 100644
+--- a/kernel/kalloc.c
++++ b/kernel/kalloc.c
+@@ -10,6 +10,7 @@
+ #include "defs.h"
+ 
+ void freerange(void *pa_start, void *pa_end);
++int num = 0;
+ 
+ extern char end[]; // first address after kernel.
+                    // defined by kernel.ld.
+@@ -59,6 +60,7 @@ kfree(void *pa)
+   acquire(&kmem.lock);
+   r->next = kmem.freelist;
+   kmem.freelist = r;
++  num++;
+   release(&kmem.lock);
+ }
+ 
+@@ -72,11 +74,17 @@ kalloc(void)
+ 
+   acquire(&kmem.lock);
+   r = kmem.freelist;
+-  if(r)
++  if(r){
+     kmem.freelist = r->next;
++    num--;
++  }
+   release(&kmem.lock);
+ 
+   if(r)
+     memset((char*)r, 5, PGSIZE); // fill with junk
+   return (void*)r;
+ }
++
++int freemem(){
++  return num*4096;
++}
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 58a8a0b..19441f7 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -295,7 +295,7 @@ fork(void)
+     return -1;
+   }
+   np->sz = p->sz;
+-
++  np->mask = p->mask;
+   // copy saved user registers.
+   *(np->trapframe) = *(p->trapframe);
+ 
+@@ -686,3 +686,13 @@ procdump(void)
+     printf("\n");
+   }
+ }
++
++int
++nproc(){
++    struct proc *p;
++    int n = 0;
++    for(p = proc; p < &proc[NPROC]; p++){
++      if(p->state != UNUSED) n++;
++    }
++    return n;
++}
+\ No newline at end of file
+diff --git a/kernel/proc.h b/kernel/proc.h
+index d021857..326af87 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -104,4 +104,7 @@ struct proc {
+   struct file *ofile[NOFILE];  // Open files
+   struct inode *cwd;           // Current directory
+   char name[16];               // Process name (debugging)
++
++  int mask;
+ };
++int nproc();
+diff --git a/kernel/syscall.c b/kernel/syscall.c
+index ed65409..e543a4e 100644
+--- a/kernel/syscall.c
++++ b/kernel/syscall.c
+@@ -101,6 +101,8 @@ extern uint64 sys_unlink(void);
+ extern uint64 sys_link(void);
+ extern uint64 sys_mkdir(void);
+ extern uint64 sys_close(void);
++extern uint64 sys_trace(void);
++extern uint64 sys_sysinfo(void);
+ 
+ // An array mapping syscall numbers from syscall.h
+ // to the function that handles the system call.
+@@ -126,6 +128,34 @@ static uint64 (*syscalls[])(void) = {
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_trace]   sys_trace,
++[SYS_sysinfo]  sys_sysinfo,
++};
++
++static char*  syscallnames[] = {
++[SYS_fork]    "fork",
++[SYS_exit]    "exit",
++[SYS_wait]    "wait",
++[SYS_pipe]    "pipe",
++[SYS_read]    "read",
++[SYS_kill]    "kill",
++[SYS_exec]    "exec",
++[SYS_fstat]   "fstat",
++[SYS_chdir]   "chdir",
++[SYS_dup]     "dup",
++[SYS_getpid]  "getpid",
++[SYS_sbrk]    "sbrk",
++[SYS_sleep]   "sleep",
++[SYS_uptime]  "uptime",
++[SYS_open]    "open",
++[SYS_write]   "write",
++[SYS_mknod]   "mknod",
++[SYS_unlink]  "unlink",
++[SYS_link]    "link",
++[SYS_mkdir]   "mkdir",
++[SYS_close]   "close",
++[SYS_trace]   "trace",
++[SYS_sysinfo]   "sysinfo",
+ };
+ 
+ void
+@@ -139,6 +169,9 @@ syscall(void)
+     // Use num to lookup the system call function for num, call it,
+     // and store its return value in p->trapframe->a0
+     p->trapframe->a0 = syscalls[num]();
++        if(p->mask & (1 << num)){
++      printf("%d: syscall %s -> %d\n", p->pid, syscallnames[num], p->trapframe->a0);
++    }
+   } else {
+     printf("%d %s: unknown sys call %d\n",
+             p->pid, p->name, num);
+diff --git a/kernel/syscall.h b/kernel/syscall.h
+index bc5f356..a776223 100644
+--- a/kernel/syscall.h
++++ b/kernel/syscall.h
+@@ -1,22 +1,24 @@
+ // System call numbers
+-#define SYS_fork    1
+-#define SYS_exit    2
+-#define SYS_wait    3
+-#define SYS_pipe    4
+-#define SYS_read    5
+-#define SYS_kill    6
+-#define SYS_exec    7
+-#define SYS_fstat   8
+-#define SYS_chdir   9
+-#define SYS_dup    10
+-#define SYS_getpid 11
+-#define SYS_sbrk   12
+-#define SYS_sleep  13
+-#define SYS_uptime 14
+-#define SYS_open   15
+-#define SYS_write  16
+-#define SYS_mknod  17
+-#define SYS_unlink 18
+-#define SYS_link   19
+-#define SYS_mkdir  20
+-#define SYS_close  21
++#define SYS_fork     1
++#define SYS_exit     2
++#define SYS_wait     3
++#define SYS_pipe     4
++#define SYS_read     5
++#define SYS_kill     6
++#define SYS_exec     7
++#define SYS_fstat    8
++#define SYS_chdir    9
++#define SYS_dup     10
++#define SYS_getpid  11
++#define SYS_sbrk    12
++#define SYS_sleep   13
++#define SYS_uptime  14
++#define SYS_open    15
++#define SYS_write   16
++#define SYS_mknod   17
++#define SYS_unlink  18
++#define SYS_link    19
++#define SYS_mkdir   20
++#define SYS_close   21
++#define SYS_trace   22
++#define SYS_sysinfo 23
+\ No newline at end of file
+diff --git a/kernel/sysproc.c b/kernel/sysproc.c
+index 3b4d5bd..e14c5ab 100644
+--- a/kernel/sysproc.c
++++ b/kernel/sysproc.c
+@@ -5,7 +5,9 @@
+ #include "memlayout.h"
+ #include "spinlock.h"
+ #include "proc.h"
++#include "sysinfo.h"
+ 
++int freemem();
+ uint64
+ sys_exit(void)
+ {
+@@ -91,3 +93,25 @@ sys_uptime(void)
+   release(&tickslock);
+   return xticks;
+ }
++
++uint64
++sys_trace(void)
++{
++  int n;
++  argint(0, &n);
++  myproc()->mask = n;
++  return 0;
++}
++
++uint64
++sys_sysinfo(void)
++{
++  struct sysinfo s;
++  uint64 a;
++  argaddr(0, &a);
++  s.nproc = nproc();
++  s.freemem = freemem();
++  if(copyout(myproc()->pagetable, a, (char*) &s, sizeof(s)) < 0)
++    return -1;
++  return 0;
++}
+\ No newline at end of file
+diff --git a/time.txt b/time.txt
+new file mode 100644
+index 0000000..e440e5c
+--- /dev/null
++++ b/time.txt
+@@ -0,0 +1 @@
++3
+\ No newline at end of file
+diff --git a/user/user.h b/user/user.h
+index 4d398d5..1fdbf47 100644
+--- a/user/user.h
++++ b/user/user.h
+@@ -22,6 +22,10 @@ int getpid(void);
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int trace(int);
++struct sysinfo;
++int sysinfo(struct sysinfo *);
++
+ 
+ // ulib.c
+ int stat(const char*, struct stat*);
+diff --git a/user/usys.pl b/user/usys.pl
+index 01e426e..353a1f8 100755
+--- a/user/usys.pl
++++ b/user/usys.pl
+@@ -36,3 +36,5 @@ entry("getpid");
+ entry("sbrk");
+ entry("sleep");
+ entry("uptime");
++entry("trace");
++entry("sysinfo");
+\ No newline at end of file

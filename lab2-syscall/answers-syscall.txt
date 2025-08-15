@@ -1,0 +1,6 @@
+trap
+7
+usermode
+lw	s2,0(zero) # 0 <_entry-0x80000000>
+address 0 is not mapped in the kernel address space, it is load page fault
+initcode with process id 1
