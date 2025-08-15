@@ -1,0 +1,6 @@
+1. parameter transfer when calling function uses registers a0-a7 to store arguments, in this case 13 is stored in a2 register.
+2. because of inlining, f and g functions are not directly called in main, f's calculated value is stored into register.
+3. 0x652
+4. 0x38
+5.the output is HE110 World. we would change i into 0x726c6400 (so that it will print rld instead of dlr).
+6.it is a garbage value from register that stores function parameters.
